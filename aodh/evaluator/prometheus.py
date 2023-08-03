@@ -19,125 +19,29 @@ from oslo_config import cfg
 from oslo_log import log
 
 from aodh.evaluator import threshold
+from observabilityclient import client
 
 
 LOG = log.getLogger(__name__)
 OPTS = [
-    cfg.StrOpt('prometheus_host',
-               default='127.0.0.1',
-               help='The host where Prometheus API instance is running.'),
-    cfg.IntOpt('prometheus_port',
-               default=9090,
-               help='The port on which Prometheus API instance'
-                    ' is listening.'),
-    cfg.StrOpt('prometheus_ca_cert',
-               help='Path to TLS CA cert file for Prometheus host'
-                    ' verification.'),
-    cfg.StrOpt('prometheus_client_cert',
-               help='Path to TLS cert file for Prometheus client'
-                    ' verification.'),
-    cfg.StrOpt('prometheus_client_key',
-               help='Path to TLS key file for Prometheus client'
-                    ' verification.'),
-    cfg.StrOpt('prometheus_user',
-               help='Username for HTTP basic authententication'
-                    ' on Prometheus API instance.'),
-    cfg.StrOpt('prometheus_password',
-               secret=True,
-               help='Password for HTTP basic authententication'
-                    ' on Prometheus API instance.'),
+    cfg.BoolOpt('prometheus_disable_rbac',
+               default=False,
+               help='Disable RBAC for Prometheus evaluator.'),
 ]
-
-
-class PrometheusAPIClientError(Exception):
-    def __init__(self, response):
-        self.resp = response
-
-    def __repr__(self) -> str:
-        if self.resp.status_code != requests.codes.ok:
-            return f'[{self.resp.status_code}] {self.resp.reason}'
-        else:
-            decoded = self.resp.json()
-            return f'[{decoded.status}]'
-
-
-class PrometheusMetric:
-    def __init__(self, input):
-        self.timestamp = input['value'][0]
-        self.labels = input['metric']
-        self.value = input['value'][1]
-
-    def __repr__(self) -> str:
-        return "%s %f" % (
-            ["%s=%s" % (k, v) for k, v in self.labels.items()],
-            self.value
-        )
-
-
-class PrometheusRBAC:
-    # TODO(mmagr): this class will be responsible for attaching Keystone
-    #              tenant info to prometheus queries
-    def __init__(self, rbac):
-        """TODO(mmagr)"""
-
-    def enrich_query(self, query):
-        # TODO(mmagr)
-        return query
-
-
-class PrometheusAPIClient:
-    def __init__(self, host, rbac=None):
-        self._host = host
-        self._rbac = PrometheusRBAC(rbac)
-        self._session = requests.Session()
-        self._session.verify = False
-
-    def set_ca_cert(self, ca_cert):
-        self._session.verify = ca_cert
-
-    def set_client_cert(self, client_cert, client_key):
-        self._session.cert = client_cert
-        self._session.key = client_key
-
-    def set_basic_auth(self, auth_user, auth_password):
-        self._session.auth = (auth_user, auth_password)
-
-    def get(self, query):
-        url = (f"{'https' if self._session.verify else 'http'}://"
-               f"{self._host}/api/v1/query")
-        q = self._rbac.enrich_query(query)
-        resp = self._session.get(url, params=dict(query=q),
-                                 headers={'Accept': 'application/json'})
-        if resp.status_code != requests.codes.ok:
-            raise PrometheusAPIClientError(resp)
-        decoded = resp.json()
-        if decoded['status'] != 'success':
-            raise PrometheusAPIClientError(resp)
-
-        if decoded['data']['resultType'] == 'vector':
-            result = [PrometheusMetric(i) for i in decoded['data']['result']]
-        else:
-            result = [PrometheusMetric(decoded)]
-        return result
 
 
 class PrometheusBase(threshold.ThresholdEvaluator):
     def __init__(self, conf):
         super(PrometheusBase, self).__init__(conf)
-        php = f'{conf.prometheus_host}:{conf.prometheus_port}'
-        self._promclient = PrometheusAPIClient(php)
-        if conf.prometheus_ca_cert:
-            self._promclient.set_ca_cert(conf.prometheus_ca_cert)
-        if conf.prometheus_client_cert and conf.prometheus_client_key:
-            self._promclient.set_client_cert(conf.prometheus_client_cert,
-                                             conf.prometheus_client_key)
-        if conf.prometheus_user and conf.prometheus_password:
-            self._promclient.set_basic_auth(conf.prometheus_user,
-                                            conf.prometheus_password)
+        session = keystone_client.get_session(conf)
+        opts = {'interface': conf.service_credentials.interface,
+                'region_name': conf.service_credentials.region_name}
+        self._prom = client.Client('1', session, adapter_options=opts)
 
     def _get_metric_data(self, query):
         LOG.debug(f'Querying Prometheus instance on: {query}')
-        return self._promclient.get(query)
+        return self._prom.query.query(query,
+                                      disable_rbac=conf.prometheus_disable_rbac)
 
 
 class PrometheusEvaluator(PrometheusBase):
